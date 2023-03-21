@@ -90,13 +90,8 @@ class Flow:
         self._queues: List[mp.Queue] = []
         self._task_futures: Dict[str, asyncio.Future] = {}
         self._queue_size: Optional[int] = queue_size
+        self._manager: Optional[mp.Manager] = None
 
-        if mp_start_method != "fork" and mp_start_method != mp.get_start_method():
-            log.error(f'MP start method {mp_start_method!r} is set for Flow, it should also be set'
-                      f' in the if __name__ == "__main__" clause of the main module')
-            raise MPStartMethodValueError(f'Multiprocessing start method mismatch: '
-                                          f'got {mp.get_start_method()!r} for main process '
-                                          f'and {mp_start_method!r} for Flow')
         self._mp_start_method = mp_start_method
 
         if not metrics_enabled:
@@ -123,6 +118,7 @@ class Flow:
         """
         log.info('Flow is starting')
         self._state = FlowState.STARTING
+        self._manager = mp.Manager()
         self._run_steps(timeout)
         self._run_tasks()
         self._state = FlowState.RUNNING
@@ -231,18 +227,21 @@ class Flow:
             log.info('Flow has zero steps -> do nothing')
             return
 
+        if self._manager is None:
+            raise Exception('multiprocessing Manager is not inited')
+
         # count how many processes we will create, to setup a barrier
         total_procs = reduce(lambda a, b: a + b.nprocs, self._steps, 0)
         # also count main process
         total_procs += 1
-        start_barrier = Barrier(total_procs)
+        start_barrier = self._manager.Barrier(total_procs)
 
         queue_size = self._calc_queue_size(self._steps[0])
-        self._queues.append(TaskMetricsQueue(queue_size))
+        self._queues.append(self._manager.Queue(queue_size))
 
         for step_number, step in enumerate(self._steps, 1):
             queue_size = self._calc_queue_size(step)
-            self._queues.append(TaskMetricsQueue(queue_size))
+            self._queues.append(self._manager.Queue(queue_size))
             worker_curr = Worker(
                 self._queues[-2],
                 self._queues[-1],
@@ -250,14 +249,13 @@ class Flow:
                 step.handle_condition,
                 step.batch_size,
                 step.batch_timeout,
-                mp.RLock() if step.nprocs > 1 and step.batch_size > 1 else None,
+                self._manager.RLock() if step.nprocs > 1 and step.batch_size > 1 else None,
                 step_number,
             )
             self._contexts[step.handler] = start_processes(
                 worker_curr.loop,
                 nprocs=step.nprocs, join=False, daemon=True, start_method=self._mp_start_method,
                 args=(start_barrier,),
-                on_start_wait=step.on_start_wait,
             )
             log.info(f'Created step {step.handler}, '
                      f'queue_in: {self._queues[-2]}, queue_out:{self._queues[-1]}')

@@ -9,6 +9,8 @@ from enum import Enum
 from functools import cached_property
 from functools import reduce
 from multiprocessing import Barrier
+from multiprocessing.managers import SyncManager
+from queue import PriorityQueue
 from threading import BrokenBarrierError
 from time import monotonic
 from typing import Dict, List, Literal, Optional, Union
@@ -43,6 +45,13 @@ _resource_tracker.ensure_running()
 def _check_env():
     if not sys.version_info >= (3, 8):
         raise RuntimeError('Requires python 3.8 or higher to use multiprocessing.shared_memory')
+
+
+class PQManager(SyncManager):
+    pass
+
+
+PQManager.register('PriorityQueue', PriorityQueue)
 
 
 class FlowStep:
@@ -99,6 +108,7 @@ class Flow:
                                           f'got {mp.get_start_method()!r} for main process '
                                           f'and {mp_start_method!r} for Flow')
         self._mp_start_method = mp_start_method
+        self._mp_manager = PQManager()
 
         if not metrics_enabled:
             log.warn('Metrics collecting is disabled')
@@ -213,6 +223,7 @@ class Flow:
             task.cancel()
 
         self._join_context(self._processes_context)
+        self._mp_manager.shutdown()
 
         self._state = FlowState.STOPPED
         log.info('Flow was stopped')
@@ -236,6 +247,8 @@ class Flow:
             log.info('Flow has zero steps -> do nothing')
             return
 
+        self._mp_manager.start()
+
         # count how many processes we will create, to setup a barrier
         total_procs = reduce(lambda a, b: a + b.nprocs, self._steps, 0)
         # also count main process
@@ -246,7 +259,7 @@ class Flow:
             queue_size = self._calc_queue_size(step)
             self._queues.append(
                 FlowStepQueue(
-                    queue=TaskMetricsQueue(queue_size),
+                    queue=self._mp_manager.PriorityQueue(queue_size),
                     handle_condition=step.handle_condition,
                 )
             )
@@ -255,7 +268,7 @@ class Flow:
         queue_size = self._calc_queue_size(self._steps[-1])
         self._queues.append(
             FlowStepQueue(
-                queue=TaskMetricsQueue(queue_size),
+                queue=self._mp_manager.PriorityQueue(queue_size),
                 handle_condition=operator.truth,
             )
         )
@@ -280,8 +293,8 @@ class Flow:
                      f'queue_out: {self._queues[step_number].queue}')
 
         # fix to avoid deadlock on program exit
-        for step_queue in self._queues:
-            step_queue.queue.cancel_join_thread()
+        # for step_queue in self._queues:
+        #     step_queue.queue.cancel_join_thread()
 
         try:
             log.info(f'Waiting for all workers to startup for {timeout} seconds...')
@@ -339,10 +352,10 @@ class Flow:
                 if not task:
                     continue
 
-                task.metrics.stop_transfer_timer(MAIN_PROCESS)
+                task.metrics.stop_transfer_timer(MAIN_PROCESS, task.priority)
                 task_size = getattr(self._queues[-1].queue, 'task_size', None)
                 if task_size:
-                    task.metrics.save_task_size(task_size, MAIN_PROCESS)
+                    task.metrics.save_task_size(task_size, MAIN_PROCESS, task.priority)
 
                 future = self._task_futures.get(task.task_id)
 

@@ -82,10 +82,10 @@ class Worker:
 
         log.debug(f'[{self.name}] Have message')
 
-        task.metrics.stop_transfer_timer(self.step_name)
+        task.metrics.stop_transfer_timer(self.step_name, task.priority)
         task_size = getattr(self.queue_in, 'task_size', None)
         if task_size:
-            task.metrics.save_task_size(task_size, self.step_name)
+            task.metrics.save_task_size(task_size, self.step_name, task.priority)
 
         # don't pass an expired task to the next steps
         if task.is_expired():

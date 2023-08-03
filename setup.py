@@ -8,7 +8,7 @@ packages = ['aqueduct']
 setup(
     name='aqueduct',
     packages=find_packages(),
-    version='1.10.14',
+    version='1.10.15.dev3',
     license='MIT',
     license_files='LICENSE.txt',
     author='Data Science SWAT',

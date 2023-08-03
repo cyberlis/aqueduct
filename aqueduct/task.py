@@ -8,12 +8,14 @@ from .shm import SharedFieldsMixin
 
 class BaseTask(SharedFieldsMixin):
     task_id: Union[str, Sequence[str]] = ''
+    priority: int = 0
     expiration_time = None
     metrics: TaskMetrics = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.task_id = str(uuid.uuid4())
+        self.priority = 0
         self.metrics = TaskMetrics()
 
     def __repr__(self):
@@ -24,11 +26,17 @@ class BaseTask(SharedFieldsMixin):
     def __str__(self):
         return self.__repr__()
 
+    def __lt__(self, other: 'BaseTask') -> bool:
+        return self.priority > other.priority
+
     def set_timeout(self, timeout_sec: float):
         self.expiration_time = monotonic() + timeout_sec
 
     def is_expired(self) -> bool:
         return monotonic() >= self.expiration_time
+
+    def set_priority(self, priority: int) -> None:
+        self.priority = priority
 
     def _update_shared_fields(self, source_task: 'BaseTask') -> Set[str]:
         """Updates task shared fields and returns shared fields names.

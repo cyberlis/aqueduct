@@ -2,6 +2,7 @@ import asyncio
 import os
 import queue
 import time
+from itertools import chain
 from typing import List
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,7 @@ from aqueduct.flow import (
 )
 from aqueduct.handler import BaseTaskHandler
 from aqueduct.metrics import MAIN_PROCESS
-from aqueduct.task import BaseTask
+from aqueduct.task import BaseTask, DEFAULT_PRIORITY
 from tests.unit.conftest import (
     Task,
     run_flow,
@@ -199,9 +200,9 @@ class TestFlow:
     def test_get_queues_info(self, simple_flow: Flow):
         info = simple_flow._get_queues_info()
         queues = simple_flow._queues
-        assert len(info) == len(queues)
-        assert MAIN_PROCESS in info[queues[0].queue]
-        assert MAIN_PROCESS in info[queues[-1].queue]
+        assert len(info) == len(queues[DEFAULT_PRIORITY])
+        assert MAIN_PROCESS in info[queues[DEFAULT_PRIORITY][0].queue]
+        assert MAIN_PROCESS in info[queues[DEFAULT_PRIORITY][-1].queue]
 
     async def test_process_expired_task(self, log_file, aqueduct_logger,
                                         slow_sleep_handlers, slow_simple_flow, task):
@@ -221,7 +222,7 @@ class TestFlow:
 
     async def test_enqueue_timeout(self, sleep_handlers, simple_flow, task):
         timeouts = [handler._handler_sec for handler in sleep_handlers]
-        with patch.object(simple_flow._queues[0].queue, 'put', MagicMock(side_effect=queue.Full)):
+        with patch.object(simple_flow._queues[DEFAULT_PRIORITY][0].queue, 'put', MagicMock(side_effect=queue.Full)):
             with pytest.raises(FlowError, match='timeout'):
                 await simple_flow.process(task, timeout_sec=1)
             await asyncio.sleep(sum(timeouts))

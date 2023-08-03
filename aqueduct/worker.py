@@ -1,8 +1,9 @@
 import multiprocessing as mp
 import queue
 import sys
+from concurrent.futures import ThreadPoolExecutor, Future, wait, FIRST_COMPLETED
 from threading import BrokenBarrierError
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from .handler import BaseTaskHandler
 from .logger import log
@@ -11,7 +12,7 @@ from .metrics.timer import (
     timeit,
 )
 from .queues import FlowStepQueue, select_next_queue
-from .task import BaseTask, StopTask
+from .task import BaseTask, DEFAULT_PRIORITY, StopTask
 
 MAX_SPIN_ITERATIONS=1000
 
@@ -29,17 +30,15 @@ class Worker:
             task_handler: BaseTaskHandler,
             batch_size: int,
             batch_timeout: float,
-            batch_lock: Optional[mp.RLock],
             step_number: int,
     ):
         self._queues = queues
-        self.queue_in = queues[step_number - 1].queue
+        self._queue_priorities = len(self._queues)
         self.task_handler = task_handler
         self.name = task_handler.__class__.__name__
         self.step_name = self.task_handler.get_step_name(step_number)
         self._batch_size = batch_size
         self._batch_timeout = batch_timeout
-        self._batch_lock = batch_lock
         self._stop_task: BaseTask = None  # noqa
         self._step_number = step_number
 
@@ -47,7 +46,7 @@ class Worker:
         """Runs something huge (e.g. model) in child process."""
         self.task_handler.on_start()
 
-    def _wait_task(self, timeout: float) -> Optional[BaseTask]:
+    def _wait_task(self, timeout: float, queue_in: mp.Queue) -> Optional[BaseTask]:
         task = None
         # There is a problem with Python MP Queue implementation.
         # queue.get() can raise Empty exception even thou queue is in fact not empty.
@@ -62,15 +61,15 @@ class Worker:
             i += 1
             try:
                 if timeout == 0:
-                    task = self.queue_in.get(block=False)
+                    task = queue_in.get(block=False)
                 else:
-                    task = self.queue_in.get(timeout=timeout)
+                    task = queue_in.get(timeout=timeout)
             except queue.Empty:
-                # additionaly check queue size to make sure that there is in fact no tasks there.
+                # additionally check queue size to make sure that there is in fact no tasks there.
                 # if size > 0 then Empty exception was fake -> we should try to call get() again
                 # since macos does not support qsize method - ignore that check
-                # (it would be greate to make a proper queue later)
-                if sys.platform == 'darwin' or self.queue_in.qsize() == 0:
+                # (it would be great to make a proper queue later)
+                if sys.platform == 'darwin' or queue_in.qsize() == 0:
                     break
 
         if not task:
@@ -83,7 +82,7 @@ class Worker:
         log.debug(f'[{self.name}] Have message')
 
         task.metrics.stop_transfer_timer(self.step_name)
-        task_size = getattr(self.queue_in, 'task_size', None)
+        task_size = getattr(queue_in, 'task_size', None)
         if task_size:
             task.metrics.save_task_size(task_size, self.step_name)
 
@@ -94,7 +93,7 @@ class Worker:
 
         return task
 
-    def _get_batch_with_timeout(self, batch: List[BaseTask]) -> List[BaseTask]:
+    def _get_batch_with_timeout(self, batch: List[BaseTask], queue_in: mp.Queue) -> List[BaseTask]:
         """ Collecting incoming tasks into batch.
         We will be waiting until number of tasks in batch would be equal `batch_size`.
         If batch could not be fully collected in batch_timeout time -> return what we have at that time.
@@ -102,7 +101,7 @@ class Worker:
         timeout = self._batch_timeout
         while True:
             with timeit() as passed_time:
-                task = self._wait_task(timeout)
+                task = self._wait_task(timeout, queue_in)
 
             if task:
                 batch.append(task)
@@ -118,14 +117,14 @@ class Worker:
             # timeout should not be less then 1ms, to avoid unnecessary short sleeps
             timeout = max(timeout, 0.001)
 
-    def _get_batch_dynamic(self, batch):
+    def _get_batch_dynamic(self, batch: List[BaseTask], queue_in: mp.Queue) -> List[BaseTask]:
         """ Collecting incoming tasks into batch.
         This method will not be waiting for batch_timeout to collect full batch,
         we just simply get all tasks that are currently in the queue and making batch only from them.
         """
         while True:
             task = None
-            task = self._wait_task(timeout=0.)
+            task = self._wait_task(timeout=0.0, queue_in=queue_in)
 
             if task:
                 batch.append(task)
@@ -136,7 +135,7 @@ class Worker:
 
         return batch
 
-    def _wait_batch(self) -> List[BaseTask]:
+    def _wait_batch(self, step_queue: FlowStepQueue) -> List[BaseTask]:
         batch = []
         timer = Timer()
 
@@ -144,7 +143,7 @@ class Worker:
         while True:
             # wait for some long amount of time (10 secs), and wait again,
             # until we eventually get a task
-            task = self._wait_task(10.)
+            task = self._wait_task(10.0, step_queue.queue)
             if task:
                 batch.append(task)
                 timer.start()
@@ -155,9 +154,9 @@ class Worker:
         # waiting for the rest of the batch if batch_size > 1
         if self._batch_size > 1:
             if self._batch_timeout > 0:
-                batch = self._get_batch_with_timeout(batch)
+                batch = self._get_batch_with_timeout(batch, step_queue.queue)
             else:
-                batch = self._get_batch_dynamic(batch)
+                batch = self._get_batch_dynamic(batch, step_queue.queue)
 
         timer.stop()
         if self._batch_size > 1:
@@ -166,25 +165,42 @@ class Worker:
 
         return batch
 
+    def _wait_batch_with_lock(self, step_queue: FlowStepQueue) -> List[BaseTask]:
+        if step_queue.batch_lock is not None:
+            with step_queue.batch_lock:
+                return self._wait_batch(step_queue=step_queue)
+        else:
+            return self._wait_batch(step_queue=step_queue)
+
     def _iter_batches(self) -> Iterator[Optional[List[BaseTask]]]:
         """ Returns iterator over input task batches.
         If there is no tasks in queue -> block until task appears.
         This iterator takes into account batch_timeout and batch size.
         If input task is expired or filtered by condition - it would not be placed in batch.
         """
-        while True:
-            if self._batch_lock:
-                # to take a queue_in lock for the duration of batch filling time
-                with self._batch_lock:
-                    tasks_batch = self._wait_batch()
-            else:
-                tasks_batch = self._wait_batch()
+        running_tasks: Dict[int, Future] = {}
+        with ThreadPoolExecutor(max_workers=self._queue_priorities) as executor:
+            while True:
+                # process queues with maximum priority first
+                for priority in reversed(range(self._queue_priorities)):
+                    if running_tasks.get(priority) is None:
+                        task = executor.submit(
+                            self._wait_batch_with_lock,
+                            self._queues[priority][self._step_number - 1]
+                        )
+                        running_tasks[priority] = task
+                wait(running_tasks.values(), return_when=FIRST_COMPLETED)
 
-            if tasks_batch:
-                yield tasks_batch
+                for priority in reversed(range(self._queue_priorities)):
+                    task = running_tasks.get(priority)
+                    if task is not None and task.done():
+                        running_tasks[priority] = None
+                        batch = task.result()
+                        if batch:
+                            yield batch
 
-            if self._stop_task:
-                break
+                if self._stop_task:
+                    break
 
     def _post_handle(self, task: BaseTask):
         task.metrics.start_transfer_timer(self.step_name)
@@ -220,4 +236,4 @@ class Worker:
                 self._post_handle(task)
 
         if self._stop_task:
-            self._queues[self._step_number].queue.put(self._stop_task)
+            self._queues[DEFAULT_PRIORITY][self._step_number].queue.put(self._stop_task)

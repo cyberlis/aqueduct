@@ -51,8 +51,10 @@ def worker():
         iq = multiprocessing.Queue(10000)
         oq = multiprocessing.Queue(10000)
         queues = [
-            FlowStepQueue(iq, lambda _: True),
-            FlowStepQueue(oq, lambda _: True),
+            [
+                FlowStepQueue(iq, lambda _: True),
+                FlowStepQueue(oq, lambda _: True),
+            ]
         ]
         worker = Worker(
             queues=queues,

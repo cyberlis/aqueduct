@@ -29,7 +29,7 @@ class SharedFieldsMixin:
         """
 
         shm_wrapper = SharedMemoryWrapper(size)
-        shared_value = BytesSharedData(shm_wrapper, size, bytes)
+        shared_value = BytesSharedData(shm_wrapper, size)
 
         offset = 0
         while True:
@@ -94,3 +94,7 @@ class SharedFieldsMixin:
         self.__dict__.update(state)
         for f_name, shared_value in self._shared_fields.items():
             self.__dict__[f_name] = shared_value.get_data()
+
+    def __del__(self):
+        for field_name in self._shared_fields.keys():
+            self.__dict__[field_name] = None
